@@ -4,6 +4,7 @@ import * as path from 'path';
 import { applyLogLevelFromEnv, createLogger, logFormatFromEnv } from '../common/services/logger.service';
 import { writeSecretFile } from '../common/utils/secret-file';
 import { clearBlankEnv, recordOsEnvKeys, recordPinnedEnvKeys, BLANK_SHADOWED_ENV_KEYS } from './env-precedence';
+import { resolveEnvironmentRoot } from './environment-root';
 
 // LoggerService reads its format per write, and the loader writes its own lines only once both env
 // files are merged and LOG_LEVEL is applied, so those lines follow what the files configure.
@@ -47,8 +48,19 @@ export function loadEnvironment(): void {
 }
 
 function mergeEnvironment(lines: Array<{ level: 'log' | 'warn'; message: string }>): void {
-  const generatedEnvPath = path.resolve(process.cwd(), 'data', '.env.generated');
-  const userEnvPath = path.resolve(process.cwd(), '.env');
+  const workingDirectory = process.cwd();
+  const environmentRoot = resolveEnvironmentRoot(workingDirectory);
+  const generatedEnvPath = path.resolve(environmentRoot, 'data', '.env.generated');
+  const userEnvPath = path.resolve(environmentRoot, '.env');
+
+  if (path.resolve(environmentRoot) !== path.resolve(workingDirectory)) {
+    lines.push({
+      level: 'warn',
+      message:
+        `OpenWA was started from ${workingDirectory}; loading configuration from the application directory: ` +
+        environmentRoot,
+    });
+  }
 
   // Ensure data directory exists
   const dataDir = path.dirname(generatedEnvPath);

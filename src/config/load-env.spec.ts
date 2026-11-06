@@ -2,6 +2,38 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { workerConnectionOptions } from '../modules/queue/redis-connection';
+import { resolveEnvironmentRoot } from './environment-root';
+
+describe('resolveEnvironmentRoot', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const tempDir = (): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openwa-env-root-'));
+    tempDirs.push(dir);
+    return dir;
+  };
+
+  it('uses the application directory when a process manager starts OpenWA from elsewhere', () => {
+    const cwd = tempDir();
+    const applicationRoot = tempDir();
+    fs.writeFileSync(path.join(applicationRoot, '.env'), 'BOT_SECRET=test-secret\nENGINE_TYPE=baileys\n');
+
+    expect(resolveEnvironmentRoot(cwd, applicationRoot, 'production')).toBe(applicationRoot);
+  });
+
+  it('keeps the working-directory configuration when one is present', () => {
+    const cwd = tempDir();
+    const applicationRoot = tempDir();
+    fs.writeFileSync(path.join(cwd, '.env'), 'BOT_SECRET=cwd-secret\n');
+    fs.writeFileSync(path.join(applicationRoot, '.env'), 'BOT_SECRET=app-secret\n');
+
+    expect(resolveEnvironmentRoot(cwd, applicationRoot, 'production')).toBe(cwd);
+  });
+});
 
 describe('loadEnvironment', () => {
   let envBackup: NodeJS.ProcessEnv;
