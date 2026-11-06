@@ -2,6 +2,11 @@ import { MigrationInterface, QueryRunner, Table, TableIndex } from 'typeorm';
 
 export class AddBotIntegrationTables1787300000000 implements MigrationInterface {
   public async up(queryRunner: QueryRunner): Promise<void> {
+    const isPostgres = queryRunner.connection.options.type === 'postgres';
+    const dateTimeType = isPostgres ? 'timestamp' : 'datetime';
+    const currentDateTime = isPostgres ? 'now()' : "datetime('now')";
+    const falseDefault = isPostgres ? false : 0;
+
     // Create otp_codes table
     await queryRunner.createTable(
       new Table({
@@ -25,15 +30,16 @@ export class AddBotIntegrationTables1787300000000 implements MigrationInterface 
           {
             name: 'verified',
             type: 'boolean',
-            default: 0,
+            default: falseDefault,
           },
           {
             name: 'expiresAt',
-            type: 'datetime',
+            type: dateTimeType,
           },
           {
             name: 'createdAt',
-            type: 'datetime',
+            type: dateTimeType,
+            default: currentDateTime,
           },
         ],
       }),
@@ -95,16 +101,16 @@ export class AddBotIntegrationTables1787300000000 implements MigrationInterface 
           {
             name: 'reminderSent',
             type: 'boolean',
-            default: 0,
+            default: falseDefault,
           },
           {
             name: 'reminderSentAt',
-            type: 'datetime',
+            type: dateTimeType,
             isNullable: true,
           },
           {
             name: 'customerResponseAt',
-            type: 'datetime',
+            type: dateTimeType,
             isNullable: true,
           },
           {
@@ -115,11 +121,13 @@ export class AddBotIntegrationTables1787300000000 implements MigrationInterface 
           },
           {
             name: 'createdAt',
-            type: 'datetime',
+            type: dateTimeType,
+            default: currentDateTime,
           },
           {
             name: 'updatedAt',
-            type: 'datetime',
+            type: dateTimeType,
+            default: currentDateTime,
           },
         ],
       }),

@@ -1,4 +1,4 @@
-import { jsonColumnType, dateColumnType } from './column-types';
+import { jsonColumnType, dateColumnType, nativeDateTimeColumnType } from './column-types';
 
 // These helpers resolve the DATA connection dialect from the global DATABASE_TYPE env var.
 // Characterization tests lock the resolved type strings so any future change to the resolution is
@@ -19,15 +19,18 @@ describe('cross-DB column type helpers (data connection dialect)', () => {
     // read regardless of dialect, matching the actual text columns. Dates still differ by dialect.
     expect(jsonColumnType()).toBe('simple-json');
     expect(dateColumnType()).toBe('timestamp');
+    expect(nativeDateTimeColumnType()).toBe('timestamp');
   });
 
   it('resolves SQLite types when DATABASE_TYPE is sqlite or unset', () => {
     process.env.DATABASE_TYPE = 'sqlite';
     expect(jsonColumnType()).toBe('simple-json');
     expect(dateColumnType()).toBe('text');
+    expect(nativeDateTimeColumnType()).toBe('datetime');
 
     delete process.env.DATABASE_TYPE;
     expect(jsonColumnType()).toBe('simple-json');
     expect(dateColumnType()).toBe('text');
+    expect(nativeDateTimeColumnType()).toBe('datetime');
   });
 });

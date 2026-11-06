@@ -1,4 +1,5 @@
 import { Entity, PrimaryColumn, Column, CreateDateColumn, Index } from 'typeorm';
+import { nativeDateTimeColumnType } from '../../common/utils/column-types';
 
 @Entity('otp_codes')
 export class OtpCode {
@@ -6,7 +7,7 @@ export class OtpCode {
   id!: string;
 
   @Column({ type: 'varchar', length: 20 })
-  @Index()
+  @Index('IDX_otp_codes_phoneNumber')
   phoneNumber!: string;
 
   @Column({ type: 'varchar', length: 4 })
@@ -15,9 +16,9 @@ export class OtpCode {
   @Column({ type: 'boolean', default: false })
   verified!: boolean;
 
-  @Column({ type: 'datetime' })
+  @Column({ type: nativeDateTimeColumnType() })
   expiresAt!: Date;
 
-  @CreateDateColumn({ type: 'datetime' })
+  @CreateDateColumn({ type: nativeDateTimeColumnType() })
   createdAt!: Date;
 }

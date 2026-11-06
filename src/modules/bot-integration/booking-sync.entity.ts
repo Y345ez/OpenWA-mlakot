@@ -1,4 +1,5 @@
 import { Entity, PrimaryColumn, Column, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
+import { nativeDateTimeColumnType } from '../../common/utils/column-types';
 
 @Entity('booking_sync')
 export class BookingSync {
@@ -6,11 +7,11 @@ export class BookingSync {
   id!: string;
 
   @Column({ type: 'varchar', length: 255 })
-  @Index()
+  @Index('IDX_booking_sync_vercelBookingId')
   vercelBookingId!: string;
 
   @Column({ type: 'varchar', length: 20 })
-  @Index()
+  @Index('IDX_booking_sync_phoneNumber')
   phoneNumber!: string;
 
   @Column({ type: 'varchar', length: 255 })
@@ -31,18 +32,18 @@ export class BookingSync {
   @Column({ type: 'boolean', default: false })
   reminderSent!: boolean;
 
-  @Column({ type: 'datetime', nullable: true })
+  @Column({ type: nativeDateTimeColumnType(), nullable: true })
   reminderSentAt!: Date | null;
 
-  @Column({ type: 'datetime', nullable: true })
+  @Column({ type: nativeDateTimeColumnType(), nullable: true })
   customerResponseAt!: Date | null;
 
   @Column({ type: 'varchar', length: 10, nullable: true })
   customerResponse!: string | null; // '1' for confirm, '2' for cancel
 
-  @CreateDateColumn({ type: 'datetime' })
+  @CreateDateColumn({ type: nativeDateTimeColumnType() })
   createdAt!: Date;
 
-  @UpdateDateColumn({ type: 'datetime' })
+  @UpdateDateColumn({ type: nativeDateTimeColumnType() })
   updatedAt!: Date;
 }

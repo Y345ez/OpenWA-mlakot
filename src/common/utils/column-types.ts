@@ -34,3 +34,11 @@ export const jsonColumnType = (): 'simple-json' => 'simple-json';
  * Use with DateTransformer for SQLite compatibility.
  */
 export const dateColumnType = (): 'timestamp' | 'text' => (isPostgres() ? 'timestamp' : 'text');
+
+/**
+ * Returns the native date-time type used by TypeORM's date decorators.
+ *
+ * Unlike dateColumnType(), this intentionally keeps SQLite's native `datetime` declaration so it
+ * can also be used with CreateDateColumn and UpdateDateColumn without a transformer.
+ */
+export const nativeDateTimeColumnType = (): 'timestamp' | 'datetime' => (isPostgres() ? 'timestamp' : 'datetime');
