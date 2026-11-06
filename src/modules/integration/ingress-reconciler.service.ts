@@ -1,3 +1,4 @@
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { isUUID } from 'class-validator';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -13,11 +14,12 @@ import {
   resolveIngressJobOptions,
 } from './ingress-enqueue.service';
 import { extractConversationId } from './ingress.service';
-import { INGRESS_DISPATCH_TIMEOUT_MS } from './integration.constants';
+import { INGRESS_SHUTDOWN_WAIT_MS } from './integration.constants';
 import { PluginInstanceService } from './plugin-instance.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { IngressJobData } from '../queue/processors/ingress.processor';
 import { createLogger } from '../../common/services/logger.service';
+import { isTransientDbError } from '../../common/utils/db-errors';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
 export interface IngressReconcilerOptions {
@@ -43,6 +45,15 @@ export function resolveIngressReconcilerOptions(env: NodeJS.ProcessEnv = process
     maxAttempts: Number.isInteger(maxAttempts) && maxAttempts >= 1 ? maxAttempts : 5,
   };
 }
+
+/**
+ * How long a row whose stored payload could not be read stays out of the sweep's batch, and how many such
+ * rows are remembered. A full batch of them, oldest first, would otherwise head every sweep and no healthy
+ * row behind them would ever be replayed. Held in memory, not in the attempt budget: the row is not
+ * touched, so nothing of its budget is spent, and it is looked at again after the hour or a restart.
+ */
+const UNREADABLE_RETRY_MS = 60 * 60 * 1000;
+const UNREADABLE_REMEMBERED_MAX = 1000;
 
 export interface IngressReconcileStats {
   scanned: number;
@@ -80,6 +91,8 @@ export class IngressReconcilerService implements OnModuleInit, OnModuleDestroy {
   // The pass in flight, settled when it ends; doubles as the overlap guard.
   private inFlight?: Promise<void>;
   private readonly stop = new AbortController();
+  // Row id to the time it may be read again, for rows whose payload could not be read (see above).
+  private readonly unreadableUntil = new Map<string, number>();
 
   constructor(
     @InjectRepository(IngressEvent, 'data') private readonly events: Repository<IngressEvent>,
@@ -122,12 +135,12 @@ export class IngressReconcilerService implements OnModuleInit, OnModuleDestroy {
     let timer: NodeJS.Timeout | undefined;
     const settled = await Promise.race([
       this.inFlight.then(() => true),
-      new Promise<false>(resolve => (timer = setTimeout(resolve, INGRESS_DISPATCH_TIMEOUT_MS, false))),
+      new Promise<false>(resolve => (timer = setTimeout(resolve, INGRESS_SHUTDOWN_WAIT_MS, false))),
     ]);
     clearTimeout(timer);
     if (!settled) {
       this.logger.warn('Ingress reconcile pass still running at shutdown; continuing without it', {
-        waitMs: INGRESS_DISPATCH_TIMEOUT_MS,
+        waitMs: INGRESS_SHUTDOWN_WAIT_MS,
         action: 'ingress_reconcile_shutdown_timeout',
       });
     }
@@ -148,8 +161,18 @@ export class IngressReconcilerService implements OnModuleInit, OnModuleDestroy {
       // or one without a payload, is skipped without being written, so selecting it would hand the same
       // oldest rows back every sweep and starve every other instance's stranded deliveries. The join is
       // 1:1 (plugin_instances is unique on pluginId+instanceId), so limit() bounds rows, not join fan-out.
-      const rows = await this.events
+      // Ids only: a stored payload that does not parse (an imported or hand-edited row) fails the read of the
+      // whole batch, so no row behind it would ever be replayed. Each row is read on its own below, and one
+      // that cannot be read is kept out of the next batches for a while, so a batch full of them cannot starve
+      // the rows behind.
+      const unreadable = this.unreadableRows(now);
+      // A plugin the boot restore has not reached has no worker to take a replay, and the loop below skips its
+      // rows, so they are left out here too: a batch's worth of them would otherwise be handed back by every
+      // pass until the restore ends, with no other plugin's stranded delivery replayed in the meantime.
+      const restoring = this.loader.restorePendingIds();
+      const query = this.events
         .createQueryBuilder('e')
+        .select('e.id')
         .innerJoin(
           PluginInstance,
           'pi',
@@ -158,12 +181,31 @@ export class IngressReconcilerService implements OnModuleInit, OnModuleDestroy {
         )
         .where('e.dispatchState = :state', { state: 'pending' })
         .andWhere('e.createdAt < :cutoff', { cutoff })
-        .andWhere('e.payload IS NOT NULL')
-        .orderBy('e.createdAt', 'ASC')
-        .limit(opts.batchSize)
-        .getMany();
-      for (const row of rows) {
+        .andWhere('e.payload IS NOT NULL');
+      if (unreadable.length) query.andWhere('e.id NOT IN (:...unreadable)', { unreadable });
+      if (restoring.length) query.andWhere('e.pluginId NOT IN (:...restoring)', { restoring });
+      const batch = await query.orderBy('e.createdAt', 'ASC').limit(opts.batchSize).getMany();
+      for (const { id } of batch) {
         if (this.stop.signal.aborted) break;
+        let row: IngressEvent | null;
+        try {
+          row = await this.events.findOneBy({ id });
+        } catch (err) {
+          this.logger.error('Ingress reconcile row failed', err instanceof Error ? err.message : String(err), {
+            id,
+            action: 'ingress_reconcile_row_unreadable',
+          });
+          // Set aside only a row whose payload could not be read. A read that failed because the database
+          // said "not now" (a lock, a dropped connection) is looked at again by the next sweep, as before.
+          // A payload that does not parse is told by its error class: the message of a SyntaxError quotes
+          // the start of the text, which may read like a connection error.
+          if ((err instanceof Error && err.name === 'SyntaxError') || !isTransientDbError(err)) {
+            this.rememberUnreadable(id, now);
+          }
+          stats.skipped++;
+          continue;
+        }
+        if (!row || row.dispatchState !== 'pending') continue; // settled or removed since the batch was read
         // A row whose latest attempt is still inside the grace window cools down between replays;
         // it keeps its batch slot (bounded by maxAttempts, so the leak is capped) but is not hit again.
         if (row.lastDispatchAt && row.lastDispatchAt > cutoff) {
@@ -200,6 +242,13 @@ export class IngressReconcilerService implements OnModuleInit, OnModuleDestroy {
             stats.skipped++;
             continue;
           }
+          // The door answers a plugin the boot restore has not reached with a 503, because no worker can take
+          // the delivery yet. A replay is that delivery arriving later: it would only spend an attempt of the
+          // row's budget on the same refusal, so the row waits, untouched, for a pass after the restore.
+          if (this.loader.isRestorePending(row.pluginId)) {
+            stats.skipped++;
+            continue;
+          }
           stats.scanned++;
           const outcome = await this.reconcileRow(row, opts.maxAttempts, now);
           if (outcome === 'replayed') stats.replayed++;
@@ -224,18 +273,37 @@ export class IngressReconcilerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Ids of the rows still to be left out of a batch; forgets those whose time to be read again came. */
+  private unreadableRows(now: Date): string[] {
+    for (const [id, until] of this.unreadableUntil) {
+      if (until <= now.getTime()) this.unreadableUntil.delete(id);
+    }
+    return [...this.unreadableUntil.keys()];
+  }
+
+  private rememberUnreadable(id: string, now: Date): void {
+    this.unreadableUntil.delete(id);
+    this.unreadableUntil.set(id, now.getTime() + UNREADABLE_RETRY_MS);
+    // Oldest first, as the map keeps insertion order; a store with more of them than this is not a store
+    // an operator can leave alone, and the oldest are looked at again.
+    while (this.unreadableUntil.size > UNREADABLE_REMEMBERED_MAX) {
+      const oldest = this.unreadableUntil.keys().next().value as string;
+      this.unreadableUntil.delete(oldest);
+    }
+  }
+
   /**
    * Hand every 'pending' row created before `cutoff` that still carries its payload to the DLQ, then
    * retire the payload with a 'failed' mark, so the dedup-window prune never deletes an acknowledged
    * delivery that was never dispatched: one stranded across downtime longer than the window, one of an
    * instance disabled for that long, or any stranded row while the sweep is disabled. Same
    * DLQ-before-retire order as the replay budget path. A row the run could not settle, because its
-   * hand-off threw or its stored payload reads back as null, is not fetched again in this run, so every
-   * row is fetched at most once per run; one still 'pending' keeps its payload, which the prune keeps,
-   * and the next run retries it. Once 10 batches' worth of rows could not be settled, the run stops with
-   * one warning, which bounds a run against a store that rejects every write. A row whose payload reads
-   * back as null never settles on its own: ten batches of them ahead of healthy rows hold those rows
-   * back on every run until an operator removes them. Waits for a running sweep rather than skipping
+   * hand-off threw or its stored payload cannot be read or reads back as null, is not fetched again in
+   * this run, so every row is fetched at most once per run; one still 'pending' keeps its payload, which
+   * the prune keeps, and the next run retries it. Once 10 batches' worth of rows could not be settled,
+   * the run stops with one warning, which bounds a run against a store that rejects every write. A row
+   * whose payload is unreadable or reads back as null never settles on its own: ten batches of them
+   * ahead of healthy rows hold those rows back on every run until an operator removes them. Waits for a running sweep rather than skipping
    * the day's run; once shutdown begins, the wait ends with the sweep and the hand-off does nothing,
    * and a running hand-off stops at the next row, like a sweep.
    * A row whose instance or session was deleted, or whose queue job still owns the delivery, gets no
@@ -250,7 +318,11 @@ export class IngressReconcilerService implements OnModuleInit, OnModuleDestroy {
     const kept: string[] = [];
     try {
       for (;;) {
+        // Ids only. A stored payload that does not parse (an imported or hand-edited row) fails the read of
+        // every batch it sits in, so reading the payloads here would hold all rows behind it back on every
+        // run. Each payload is read on its own below, where such a row is kept like any other failure.
         const rows = await this.events.find({
+          select: { id: true },
           where: {
             dispatchState: 'pending',
             createdAt: LessThan(cutoff),
@@ -260,8 +332,24 @@ export class IngressReconcilerService implements OnModuleInit, OnModuleDestroy {
           order: { createdAt: 'ASC' },
           take: batchSize,
         });
-        for (const row of rows) {
+        for (const { id } of rows) {
+          // A synchronous database driver (the SQLite default) answers every statement at once, so without
+          // this the pass over a large backlog never lets a timer, request or keep-alive run.
+          await yieldToEventLoop();
           if (this.stop.signal.aborted) return retired;
+          let row: IngressEvent | null;
+          try {
+            row = await this.events.findOneBy({ id });
+          } catch (err) {
+            kept.push(id);
+            this.logger.error(
+              'Failed to read an undispatched ingress event; kept for the next run',
+              err instanceof Error ? err.message : String(err),
+              { id, action: 'ingress_event_retention_unreadable' },
+            );
+            continue;
+          }
+          if (!row || row.dispatchState !== 'pending') continue; // settled or removed since the batch was read
           if (!hasPayload(row)) {
             kept.push(row.id);
             continue;

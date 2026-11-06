@@ -1,8 +1,9 @@
 import type { WASocket } from '@whiskeysockets/baileys';
 import { BadRequestException } from '@nestjs/common';
 import sharp from 'sharp';
-import { BaileysMessaging, MAX_STICKER_FRAMES, type BaileysMessagingHost } from './baileys-messaging';
+import { BaileysMessaging, MAX_STICKER_FRAMES, blockSvgDecoding, type BaileysMessagingHost } from './baileys-messaging';
 import { createLogger } from '../../common/services/logger.service';
+import { provesNothingSent } from '../../common/errors/engine-not-sent.error';
 
 /**
  * Baileys stamps the sticker mimetype unconditionally: `prepareWAMessageMedia` applies
@@ -158,6 +159,8 @@ describe('BaileysMessaging.sendStickerMessage — what reaches the socket must r
       await expect(send).rejects.toThrow(`has ${MAX_STICKER_FRAMES + 1} frames; at most ${MAX_STICKER_FRAMES}`);
       expect(convert).not.toHaveBeenCalled();
       expect(sock.sendMessage).not.toHaveBeenCalled();
+      // Refused before anything reached WhatsApp, so a keyed send frees its Idempotency-Key.
+      expect(provesNothingSent(await send.catch((error: unknown) => error))).toBe(true);
     } finally {
       convert.mockRestore();
     }
@@ -212,5 +215,25 @@ describe('BaileysMessaging.sendStickerMessage — what reaches the socket must r
     await expect(send).rejects.toThrow(/Received 'application\/pdf'/);
     // Shipping it mislabelled is the defect; refusing after the send would not fix it.
     expect(sock.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('blockSvgDecoding', () => {
+  const SVG = Buffer.from(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>',
+  );
+  // The block is libvips process state: start from the default and leave it as found, so no other
+  // spec in the same worker sees it.
+  const reset = () => sharp.unblock({ operation: ['VipsForeignLoadSvg'] });
+  beforeEach(reset);
+  afterAll(reset);
+
+  it('refuses SVG input, which a sticker or an outbound image thumbnail would hand to librsvg, and still decodes a raster', async () => {
+    await expect(sharp(SVG).metadata()).resolves.toMatchObject({ format: 'svg' });
+
+    await blockSvgDecoding();
+
+    await expect(sharp(SVG).metadata()).rejects.toThrow();
+    await expect(sharp(PNG).metadata()).resolves.toMatchObject({ format: 'png' });
   });
 });
