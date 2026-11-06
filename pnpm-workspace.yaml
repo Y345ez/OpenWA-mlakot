@@ -1,0 +1,11 @@
+allowBuilds:
+  '@parcel/watcher': true
+  '@scarf/scarf': true
+  '@whiskeysockets/baileys': true
+  better-sqlite3: true
+  cpu-features: true
+  msgpackr-extract: true
+  protobufjs: true
+  puppeteer: true
+  sqlite3: true
+  ssh2: true
