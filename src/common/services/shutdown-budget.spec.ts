@@ -1,12 +1,13 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import * as yaml from 'js-yaml';
 import { CACHE_QUIT_TIMEOUT_MS } from '../cache/cache.service';
 import { THROTTLER_REDIS_QUIT_TIMEOUT_MS } from '../throttler/redis-throttler.storage';
 import configuration from '../../config/configuration';
 import { PLUGIN_SHUTDOWN_WAIT_MS } from '../../core/plugins/plugin-loader.service';
 import { ApiKeyUsageTracker } from '../../modules/auth/api-key-usage-tracker.service';
 import { WS_REDIS_QUIT_TIMEOUT_MS } from '../../modules/events/redis-io.adapter';
-import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integration.constants';
+import { INGRESS_SHUTDOWN_WAIT_MS } from '../../modules/integration/integration.constants';
 import { MAX_WORKER_CLOSE_WAIT_MS } from '../../modules/queue/processors/close-worker';
 import { QUEUE_NAMES } from '../../modules/queue/queue-names';
 import { QUEUE_CLOSE_TIMEOUT_MS } from '../../modules/queue/shutdown-safe-queue';
@@ -32,7 +33,7 @@ describe('shutdown time budget', () => {
   const QUEUE_COUNT = Object.keys(QUEUE_NAMES).length;
   const base =
     DEFAULT_SHUTDOWN_DELAY_MS +
-    INGRESS_DISPATCH_TIMEOUT_MS +
+    INGRESS_SHUTDOWN_WAIT_MS +
     ENGINE_TEARDOWN_TIMEOUT_MS +
     AUTOSTART_SHUTDOWN_WAIT_MS +
     DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS +
@@ -101,6 +102,29 @@ describe('shutdown time budget', () => {
     expect(grace('docker-compose.yml')).toBe(SHUTDOWN_KILL_DEADLINE_MS);
     expect(grace('docker-compose.dev.yml')).toBe(SHUTDOWN_KILL_DEADLINE_MS);
     expect(Number(/^terminationGracePeriodSeconds: (\d+)$/m.exec(values)?.[1]) * 1000).toBe(SHUTDOWN_KILL_DEADLINE_MS);
+  });
+
+  // dumb-init is PID 1 as root and gosu then runs node as uid 997. A root process without CAP_KILL can only
+  // signal its own uid, so a cap_drop ALL stack that does not re-add KILL never delivers SIGTERM to node:
+  // every stop waits out the whole kill deadline and ends in SIGKILL with no teardown at all.
+  it.each(['docker-compose.yml', 'docker-compose.dev.yml'])('%s re-adds KILL so dumb-init can signal node', file => {
+    const compose = yaml.load(readFileSync(join(root, file), 'utf8')) as {
+      services: Record<string, { container_name?: string; cap_drop?: string[]; cap_add?: string[] }>;
+    };
+    const api = Object.values(compose.services).find(service => service.container_name === 'openwa-api');
+    expect(api?.cap_drop).toContain('ALL');
+    expect(api?.cap_add).toContain('KILL');
+  });
+
+  it('re-adds KILL in the Helm chart and in the Kubernetes example of the scaling guide', () => {
+    const values = yaml.load(readFileSync(join(root, 'charts/openwa/values.yaml'), 'utf8')) as {
+      containerSecurityContext: { capabilities: { add: string[] } };
+    };
+    expect(values.containerSecurityContext.capabilities.add).toContain('KILL');
+    const scaling = readFileSync(join(root, 'docs/13-horizontal-scaling.md'), 'utf8');
+    expect(scaling).toMatch(/add: \[[^\]]*'KILL'[^\]]*\]/);
+    // Kubernetes' default grace of 30 s is shorter than the teardown can take, so the example sets the deadline.
+    expect(scaling).toContain(`terminationGracePeriodSeconds: ${SHUTDOWN_KILL_DEADLINE_MS / 1000}`);
   });
 
   it('destroys open sockets at the HTTP close, which the table counts as 0 s', () => {
